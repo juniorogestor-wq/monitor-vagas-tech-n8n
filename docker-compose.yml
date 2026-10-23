@@ -1,0 +1,77 @@
+# Monitor Inteligente de Vagas Tech - stack n8n self-hosted
+#
+# Arquitetura (decidida com o Junior em 2026-10-20):
+#   n8n e exposto SOMENTE em 127.0.0.1:5678. O proxy reverso e o SSL ficam a cargo
+#   do LiteSpeed/CyberPanel do VPS (mesmo padrao ja usado pela Evolution API).
+#   NAO usar Traefik nem abrir 80/443: essas portas sao do LiteSpeed que serve o FIN365.
+#
+# Subir:    docker compose --env-file .env up -d
+# Logs:     docker compose logs -f n8n
+# Parar:    docker compose down   (os volumes pg_data/n8n_data persistem)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_POSTGRESDB_USER}
+      POSTGRES_PASSWORD: ${DB_POSTGRESDB_PASSWORD}
+      POSTGRES_DB: ${DB_POSTGRESDB_DATABASE}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_POSTGRESDB_USER} -d ${DB_POSTGRESDB_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Sem portas publicas: acessivel apenas pela rede interna do compose.
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # SOMENTE localhost. O LiteSpeed/CyberPanel proxya o subdominio -> aqui.
+      - "127.0.0.1:5678:5678"
+    environment:
+      # ---- Banco (Postgres, nao SQLite - RNF02) ----
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${DB_POSTGRESDB_DATABASE}
+      DB_POSTGRESDB_USER: ${DB_POSTGRESDB_USER}
+      DB_POSTGRESDB_PASSWORD: ${DB_POSTGRESDB_PASSWORD}
+      # ---- Host / proxy (SSL terminado no LiteSpeed) ----
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      N8N_EDITOR_BASE_URL: https://${N8N_HOST}/
+      WEBHOOK_URL: https://${N8N_HOST}/
+      N8N_PROXY_HOPS: 1
+      # ---- Seguranca ----
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      # O n8n moderno exige criar a conta "owner" no 1o acesso (auth nativa).
+      # O basic auth abaixo e camada extra opcional (tambem pode ser feito no LiteSpeed).
+      N8N_BASIC_AUTH_ACTIVE: ${N8N_BASIC_AUTH_ACTIVE:-false}
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:-}
+      # ---- Timezone (Schedule Trigger 08:00 BRT) ----
+      GENERIC_TIMEZONE: America/Sao_Paulo
+      TZ: America/Sao_Paulo
+      # ---- Operacional ----
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  pg_data:
+  n8n_data:

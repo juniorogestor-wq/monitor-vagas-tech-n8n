@@ -1,0 +1,884 @@
+{
+  "name": "Monitor Inteligente de Vagas Tech",
+  "nodes": [
+    {
+      "id": "3a75ea9f-7da5-4cc1-9399-36559539648f",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        7888,
+        1456
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "keywords",
+              "type": "string",
+              "value": "Engenheiro de IA, Engenheiro de Agentes de IA, Agentes de IA, Arquiteto de IA, Engenheiro de IA Generativa, Desenvolvedor de IA, Especialista em Automacao de IA, Analista de Automacao de IA, Analista de IA aplicada, IA Generativa, Consultor de IA, LLM Engineer"
+            },
+            {
+              "id": "a2",
+              "name": "location",
+              "type": "string",
+              "value": "Brazil"
+            },
+            {
+              "id": "a3",
+              "name": "match_minimo",
+              "type": "number",
+              "value": 70
+            },
+            {
+              "id": "a4",
+              "name": "ingles_permitido",
+              "type": "string",
+              "value": "nenhum,basico"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "06ea8d2b-0e83-41cc-ae3c-c9a48066de67",
+      "name": "Ler Vagas Existentes",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "alwaysOutputData": true,
+      "position": [
+        8112,
+        1456
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gid=0",
+          "cachedResultName": "Vagas"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLEAPI",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "id": "ed260ad8-e574-4fae-8a62-0793145f16b6",
+      "name": "Preparar Buscas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8336,
+        1456
+      ],
+      "parameters": {
+        "jsCode": "const cfg = $('Config').first().json;\n  const kws = String(cfg.keywords || '').split(',').map(s => s.trim()).filter(Boolean);\n  return kws.map(k => ({ json: { keyword: k, _location: cfg.location || 'Brazil' } }));"
+      }
+    },
+    {
+      "id": "8849de1f-923d-4a02-ba79-5aa7afb4e7cc",
+      "name": "SerpAPI (Google Jobs)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        8544,
+        1456
+      ],
+      "parameters": {
+        "url": "https://serpapi.com/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "engine",
+              "value": "google_jobs"
+            },
+            {
+              "name": "q",
+              "value": "={{ $json.keyword }}"
+            },
+            {
+              "name": "location",
+              "value": "={{ $json._location }}"
+            },
+            {
+              "name": "hl",
+              "value": "pt-br"
+            },
+            {
+              "name": "gl",
+              "value": "br"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "REPLACE_HTTPQUERYAUTH",
+          "name": "Query Auth account"
+        }
+      }
+    },
+    {
+      "id": "c68e33d8-3b02-406a-853a-0941e1447576",
+      "name": "Normalizar + job_id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8768,
+        1456
+      ],
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Monitor Vagas Tech - logica pura dos nos \"Code\" do n8n (fonte unica).\n// Este arquivo e: (1) testado por logic-tests.cjs e (2) EMBUTIDO verbatim no\n// workflow.json pelo build-workflow.cjs (cada no Code chama estas funcoes).\n// Nao usa require() de modulo externo -> roda igual no n8n (sandbox) e no node.\n// O guard de module.exports no fim e inerte dentro do n8n (module e undefined).\n// ============================================================================\n\n// Hash estavel (djb2) sem depender de crypto/require -> portavel no sandbox n8n.\nfunction hashId(str) {\n  let h = 5381;\n  for (let i = 0; i < str.length; i++) {\n    h = ((h << 5) + h) + str.charCodeAt(i);\n    h = h & 0xffffffff;\n  }\n  return (h >>> 0).toString(16);\n}\n\n// job_id de deduplicacao: hash de titulo+empresa+localidade (normalizado).\nfunction buildJobId(title, company, location) {\n  const base = [title || '', company || '', location || ''].join('|').toLowerCase().trim();\n  return 'v_' + hashId(base);\n}\n\n// Normaliza as respostas do SerpAPI (google_jobs) em vagas limpas + dedup no lote.\n// responses = array de objetos json (um por keyword), cada um com jobs_results[].\nfunction normalizeSerpResponses(responses) {\n  const out = [];\n  const seen = new Set();\n  for (const resp of (responses || [])) {\n    const jobs = (resp && resp.jobs_results) || [];\n    for (const j of jobs) {\n      const title = String(j.title || '').trim();\n      const company = String(j.company_name || '').trim();\n      const location = String(j.location || '').trim();\n      if (!title || !company) continue; // guard: vaga sem identificacao minima\n      const job_id = buildJobId(title, company, location);\n      if (seen.has(job_id)) continue; // dedup dentro da mesma execucao\n      seen.add(job_id);\n      const via = String(j.via || '').replace(/^via\\s+/i, '').trim();\n      const description = String(j.description || '').slice(0, 1200);\n      let link = '';\n      if (Array.isArray(j.apply_options) && j.apply_options.length && j.apply_options[0].link) {\n        link = j.apply_options[0].link;\n      } else if (j.share_link) {\n        link = j.share_link;\n      }\n      const ext = j.detected_extensions || {};\n      out.push({\n        job_id, title, company, location, via, description, link,\n        schedule_type: ext.schedule_type || '',\n        posted_at: ext.posted_at || ''\n      });\n    }\n  }\n  return out;\n}\n\n// Remove cercas de codigo (```json ... ```), BOM e espacos em volta.\nfunction stripFences(raw) {\n  let s = String(raw == null ? '' : raw).replace(/^﻿/, '').trim();\n  s = s.replace(/^```(?:json)?\\s*/i, '').replace(/```$/i, '').trim();\n  return s;\n}\n\n// Parse DEFENSIVO do JSON do LLM. Nunca lanca: se falhar, marca parse_ok=false\n// e match_score=0 (vaga cai no filtro, nao quebra o fluxo - RF/risco da Issue).\nfunction parseLLMOutput(raw) {\n  const fail = (motivo, amostra) => ({\n    parse_ok: false,\n    parse_error: motivo,\n    match_score: 0,\n    english_requirement: 'desconhecido',\n    work_model: 'nao_informado',\n    contract_type: 'nao_informado',\n    salary_clt: '',\n    salary_pj: '',\n    salary_confidence: 'estimado',\n    cover_letter: '',\n    match_reasons: '',\n    red_flags: '',\n    _raw: String(amostra || '').slice(0, 500)\n  });\n\n  const s = stripFences(raw);\n  if (!s) return fail('vazio', raw);\n\n  let parsed = null;\n  try {\n    parsed = JSON.parse(s);\n  } catch (e) {\n    const m = s.match(/\\{[\\s\\S]*\\}/); // tenta extrair o primeiro objeto {...}\n    if (m) { try { parsed = JSON.parse(m[0]); } catch (_) { /* ignora */ } }\n  }\n  if (!parsed || typeof parsed !== 'object') return fail('json_invalido', s);\n\n  const joinArr = (v) => Array.isArray(v) ? v.filter(Boolean).join('; ') : String(v || '');\n  const score = Number(parsed.match_score);\n\n  return {\n    parse_ok: true,\n    parse_error: '',\n    match_score: Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : 0,\n    english_requirement: String(parsed.english_requirement || 'desconhecido').toLowerCase().trim(),\n    work_model: String(parsed.work_model || 'nao_informado'),\n    contract_type: String(parsed.contract_type || 'nao_informado'),\n    salary_clt: String(parsed.salary_clt || ''),\n    salary_pj: String(parsed.salary_pj || ''),\n    salary_confidence: String(parsed.salary_confidence || 'estimado'),\n    cover_letter: String(parsed.cover_letter || ''),\n    match_reasons: joinArr(parsed.match_reasons),\n    red_flags: joinArr(parsed.red_flags),\n    _raw: ''\n  };\n}\n\n// Regra do no IF: aprova so match >= minimo E ingles na lista permitida.\nfunction isApproved(job, minMatch, allowedEnglish) {\n  const score = Number(job.match_score) || 0;\n  const eng = String(job.english_requirement || '').toLowerCase().trim();\n  return score >= Number(minMatch) && (allowedEnglish || []).includes(eng);\n}\n\nif (typeof module !== 'undefined' && module.exports) {\n  module.exports = { hashId, buildJobId, normalizeSerpResponses, stripFences, parseLLMOutput, isApproved };\n}\n\n\n// ---- wrapper do no ----\nconst responses = $input.all().map(i => i.json);\nconst jobs = normalizeSerpResponses(responses);\nreturn jobs.map(j => ({ json: j }));"
+      }
+    },
+    {
+      "id": "44709f89-bf92-47e0-89f3-9648268224ee",
+      "name": "Filtrar Novas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8992,
+        1456
+      ],
+      "parameters": {
+        "jsCode": "const vagas = $('Ler Vagas Existentes').all();\nconst existingIds = new Set(vagas.map(r => String((r.json.ID_Vaga != null ? r.json.ID_Vaga : '')).trim()).filter(Boolean));\nconst reprov = $('Ler Reprovadas').all();\nconst rejKey = (t, c) => (String(t || '') + '|' + String(c || '')).toLowerCase().trim();\nconst rejected = new Set(reprov.map(r => rejKey(r.json.Titulo, r.json.Empresa)).filter(k => k && k !== '|'));\n// So manda ao LLM o que tem cara de IA/dados/Python/agentes (o resto seria reprovado e gastaria TPM).\nconst RELEV = /(python|intelig|machine learning|\\bml\\b|llm|\\brag\\b|data scien|cientista de dados|engenheiro de dados|\\bdados\\b|automa|django|fastapi|flask|pandas|tensorflow|pytorch|\\bia\\b|\\bai\\b|agente|generativ|\\bgenai\\b|copilot|chatbot|\\bnlp\\b)/i;\nreturn $input.all()\n  .filter(it => !existingIds.has(String(it.json.job_id)))\n  .filter(it => !rejected.has(rejKey(it.json.title, it.json.company)))\n  .filter(it => RELEV.test(((it.json.title || '') + ' ' + (it.json.description || ''))))\n  .slice(0, 3);"
+      }
+    },
+    {
+      "id": "2d3f8fa8-8641-4ee3-ac03-36c63943a505",
+      "name": "Parse defensivo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9424,
+        1456
+      ],
+      "parameters": {
+        "jsCode": "// Monitor Vagas Tech - logica pura (fonte unica, testada em logic-tests.cjs)\n  function hashId(str) {\n    let h = 5381;\n    for (let i = 0; i < str.length; i++) { h = ((h << 5) + h) + str.charCodeAt(i); h = h & 0xffffffff; }\n    return (h >>> 0).toString(16);\n  }\n  function buildJobId(title, company, location) {\n    const base = [title || '', company || '', location || ''].join('|').toLowerCase().trim();\n    return 'v_' + hashId(base);\n  }\n  function stripFences(raw) {\n    let s = String(raw == null ? '' : raw).trim();\n    s = s.replace(/^```(?:json)?\\s*/i, '').replace(/```$/i, '').trim();\n    return s;\n  }\n  function parseLLMOutput(raw) {\n    const fail = (motivo, amostra) => ({\n      parse_ok: false, parse_error: motivo, match_score: 0, english_requirement: 'desconhecido',\n      work_model: 'nao_informado', contract_type: 'nao_informado', salary_clt: '', salary_pj: '',\n      salary_confidence: 'estimado', cover_letter: '', match_reasons: '', red_flags: '',\n      _raw: String(amostra || '').slice(0, 500)\n    });\n    const s = stripFences(raw);\n    if (!s) return fail('vazio', raw);\n    let parsed = null;\n    try { parsed = JSON.parse(s); }\n    catch (e) { const m = s.match(/\\{[\\s\\S]*\\}/); if (m) { try { parsed = JSON.parse(m[0]); } catch (_) {} } }\n    if (!parsed || typeof parsed !== 'object') return fail('json_invalido', s);\n    const joinArr = (v) => Array.isArray(v) ? v.filter(Boolean).join('; ') : String(v || '');\n    const score = Number(parsed.match_score);\n    return {\n      parse_ok: true, parse_error: '',\n      match_score: Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : 0,\n      english_requirement: String(parsed.english_requirement || 'desconhecido').toLowerCase().trim(),\n      work_model: String(parsed.work_model || 'nao_informado'),\n      contract_type: String(parsed.contract_type || 'nao_informado'),\n      salary_clt: String(parsed.salary_clt || ''), salary_pj: String(parsed.salary_pj || ''),\n      salary_confidence: String(parsed.salary_confidence || 'estimado'),\n      cover_letter: String(parsed.cover_letter || ''),\n      match_reasons: joinArr(parsed.match_reasons), red_flags: joinArr(parsed.red_flags), _raw: ''\n    };\n  }\n  function isApproved(job, minMatch, allowedEnglish) {\n    const score = Number(job.match_score) || 0;\n    const eng = String(job.english_requirement || '').toLowerCase().trim();\n    return score >= Number(minMatch) && (allowedEnglish || []).includes(eng);\n  }\n\n  // ---- wrapper ----\n  const cfg = $('Config').first().json;\n  const minMatch = (cfg.match_minimo === '' || cfg.match_minimo == null) ? 70 : Number(cfg.match_minimo);\n  const allowed = String(cfg.ingles_permitido || 'nenhum,basico').split(',').map(s => s.trim()).filter(Boolean);\n  const jobs = $('Filtrar Novas').all();\n  const results = $input.all();\n  const out = [];\n  for (let i = 0; i < results.length; i++) {\n    const job = (jobs[i] && jobs[i].json) || {};\n    const r = results[i].json || {};\n    const raw = r.text != null ? r.text : (r.output != null ? r.output : (r.response != null ? r.response : (r.data != null ? r.data : '')));\n    const parsed = parseLLMOutput(raw);\n    const merged = Object.assign({}, job, parsed);\n    merged.aprovada = isApproved(parsed, minMatch, allowed);\n    out.push({ json: merged });\n  }\n  return out;"
+      }
+    },
+    {
+      "id": "5ed4286d-37d7-4bd4-ac0d-bb5ea1aec1c8",
+      "name": "Aprovada?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        9648,
+        1456
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.aprovada }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "de4bf09f-b968-405b-8c3f-935a767f415d",
+      "name": "Registrar na planilha",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        9632,
+        1200
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Vagas",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Data_Captura": "={{ $now.toISO() }}",
+            "ID_Vaga": "={{ $json.job_id }}",
+            "Titulo": "={{ $json.title }}",
+            "Empresa": "={{ $json.company }}",
+            "Localidade": "={{ $json.location }}",
+            "Modelo": "={{ $json.work_model }}",
+            "Contratacao": "={{ $json.contract_type }}",
+            "Match_%": "={{ $json.match_score }}",
+            "Ingles_Exigido": "={{ $json.english_requirement }}",
+            "Faixa_CLT": "={{ $json.salary_clt }}",
+            "Faixa_PJ": "={{ $json.salary_pj }}",
+            "Confianca_Salario": "={{ $json.salary_confidence }}",
+            "Fonte": "={{ $json.via }}",
+            "Link_Candidatura": "={{ $json.link }}",
+            "Motivos_Match": "={{ $json.match_reasons }}",
+            "Red_Flags": "={{ $json.red_flags }}",
+            "Carta_Apresentacao": "={{ $json.cover_letter }}",
+            "Status_Candidatura": "a aplicar"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Data_Captura",
+              "displayName": "Data_Captura",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ID_Vaga",
+              "displayName": "ID_Vaga",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Titulo",
+              "displayName": "Titulo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Empresa",
+              "displayName": "Empresa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Localidade",
+              "displayName": "Localidade",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Modelo",
+              "displayName": "Modelo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Contratacao",
+              "displayName": "Contratacao",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Match_%",
+              "displayName": "Match_%",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Ingles_Exigido",
+              "displayName": "Ingles_Exigido",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Faixa_CLT",
+              "displayName": "Faixa_CLT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Faixa_PJ",
+              "displayName": "Faixa_PJ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Confianca_Salario",
+              "displayName": "Confianca_Salario",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Fonte",
+              "displayName": "Fonte",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Link_Candidatura",
+              "displayName": "Link_Candidatura",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Motivos_Match",
+              "displayName": "Motivos_Match",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Red_Flags",
+              "displayName": "Red_Flags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Carta_Apresentacao",
+              "displayName": "Carta_Apresentacao",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Status_Candidatura",
+              "displayName": "Status_Candidatura",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLEAPI",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "id": "f4b033a5-dcac-4102-881c-59067c1c00b0",
+      "name": "Notificar Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        9888,
+        1392
+      ],
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🎯 Match {{ $json.match_score }}% | {{ String($json.title || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\n🏢 {{ String($json.company || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\n📍 {{ String($json.location || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }} · {{ $json.work_model }}\n💼 {{ $json.contract_type }}\n💰 CLT {{ $json.salary_clt }} | PJ {{ $json.salary_pj }} ({{ $json.salary_confidence }})\n🗣️ Ingles exigido: {{ $json.english_requirement }}\n✅ {{ String($json.match_reasons || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\n🔗 {{ String($json.link || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\n📄 Carta e detalhes completos na planilha.",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAMAPI",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "f66eb556-cb77-473c-84df-f9723e636ba3",
+      "name": "Registrar Reprovada",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        9872,
+        1616
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 890050946,
+          "mode": "list",
+          "cachedResultName": "Reprovadas",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit#gid=890050946"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Data_Captura": "={{ $now.toISO() }}",
+            "Titulo": "={{ $json.title }}",
+            "Empresa": "={{ $json.company }}",
+            "Match_%": "={{ $json.match_score }}",
+            "Ingles_Exigido": "={{ $json.english_requirement }}",
+            "Motivo_Descarte": "={{ ($json.match_score < 70 ? (\"match \" + $json.match_score + \"%\") : (\"ingles \" + $json.english_requirement)) + ($json.red_flags ? (\" | \" + $json.red_flags) : \"\") }}",
+            "Link_Candidatura": "={{ $json.link }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Data_Captura",
+              "displayName": "Data_Captura",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Titulo",
+              "displayName": "Titulo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Empresa",
+              "displayName": "Empresa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Match_%",
+              "displayName": "Match_%",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Ingles_Exigido",
+              "displayName": "Ingles_Exigido",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Motivo_Descarte",
+              "displayName": "Motivo_Descarte",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Link_Candidatura",
+              "displayName": "Link_Candidatura",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLEAPI",
+          "name": "Google Service Account account"
+        }
+      }
+    },
+    {
+      "id": "dbc4f040-577d-4257-ac99-cf58621cd8b1",
+      "name": "Erro no fluxo",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        8544,
+        1872
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "aa61b4de-6b03-484a-9649-2104341da8e1",
+      "name": "Alerta de falha (Telegram)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        8768,
+        1872
+      ],
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=⚠️ Monitor de Vagas: falha na execucao.\nWorkflow: {{ String($json.workflow && $json.workflow.name || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}\nNo: {{ $json.execution && $json.execution.lastNodeExecuted }}\nErro: {{ String($json.execution && $json.execution.error && $json.execution.error.message || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_TELEGRAMAPI",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "99dd637d-91df-45f9-aca6-6c037203e370",
+      "name": "Groq Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        9216,
+        1696
+      ],
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {}
+      },
+      "credentials": {
+        "groqApi": {
+          "id": "REPLACE_GROQAPI",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "id": "d6538b62-9948-4da0-8442-3ca09267358d",
+      "name": "Scoring (Model IA)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "position": [
+        9216,
+        1456
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Voce e um recrutador tecnico senior especializado em carreiras de IA no Brasil.\nAvalie a vaga abaixo contra o PERFIL DO CANDIDATO. Seja rigoroso e honesto.\n\nPERFIL DO CANDIDATO (fonte unica da verdade - NAO invente nada fora disto):\n- Engenheiro de IA Aplicada e Automacao de Processos. Fundador/dev do FIN365 (SaaS financeiro\n  multi-tenant em producao): +21.000 lancamentos automatizados, +6.500 transacoes Open Finance\n  conciliadas, +500 de cartao.\n- IA: LLM (Claude API), RAG em producao, orquestracao de multi-agentes (Agno/Python), prompt\n  engineering, bots de atendimento com IA, pipelines de conhecimento, agentes de codigo\n  (Claude Code, Cursor).\n- Automacao/integracao: APIs REST, webhooks, MySQL, integracao de gateways (Asaas, Inter PJ),\n  emissor fiscal (NFe.io/NFS-e), Open Finance.\n- Infra: Linux, Docker, MySQL, Apache/Nginx, firewall, monitoramento (Grafana/Zabbix),\n  virtualizacao. Quase 8 anos de producao critica na Locaweb (SysAdmin).\n- Dev: PHP/Laravel, Python. Formacao: Ciencias Contabeis + MBA em Cloud + Eng. de IA (Asimov, em curso).\n- Marketing/performance: Google Ads, Meta Ads, GTM, funil, +R$2M em midia gerenciada.\n- Idiomas: Portugues nativo. Ingles: leitura basica (NAO e intermediario/avancado/fluente).\n- Regime: aceita CLT ou PJ. Local: Sao Paulo/SP, remoto, disponivel para viagens.\n\n- IMPORTANTE - o candidato NAO possui: Machine Learning classico / modelagem estatistica / treinar e implantar modelos (redes neurais, SVM, AutoML, arvores de decisao, deep learning do zero). O foco e IA APLICADA (consumir LLMs, RAG, prompt engineering, automacao, integracao de APIs), NAO ciencia de dados / ML de modelagem.\n\nREGRAS:\n1. match_score (0-100): quao aderente a vaga e ao perfil REAL acima. Pese skills exigidas vs.\n   comprovadas. Nao infle.\n2. english_requirement: classifique a exigencia de ingles da vaga em\n   \"nenhum\" | \"basico\" | \"intermediario\" | \"avancado\" | \"fluente\". Na duvida entre basico e\n   intermediario, classifique como \"intermediario\" (conservador).\n3. work_model: \"presencial\" | \"hibrido\" | \"remoto\" | \"nao_informado\".\n4. contract_type: \"CLT\" | \"PJ\" | \"a_combinar\" | \"nao_informado\".\n5. salary: sugira faixa de mercado BR para o cargo/senioridade, em BRL, para CLT (mensal) e PJ\n   (mensal). Se a vaga informar salario, use-o. Se voce NAO tiver base confiavel, estime e marque\n   salary_confidence=\"estimado\". NUNCA apresente numero inventado como fato.\n6. cover_letter: carta de apresentacao em PT-BR (120-180 palavras), conectando SOMENTE skills\n   comprovadas do perfil acima aos requisitos da vaga. PROIBIDO inventar experiencia, cliente,\n   numero, tecnologia ou idioma que nao esteja no perfil. Tom profissional e direto, sem clichê.\n7. match_reasons: 2-4 bullets curtos do porque bate.\n8. red_flags: riscos/desalinhamentos (ex: exige ingles avancado, stack distante, senioridade).\n\n9. GAP CRITICO: se a vaga exigir dominio de Machine Learning classico, modelagem estatistica, ou treinar/implantar algoritmos (redes neurais, SVM, AutoML, arvores de decisao, deep learning), trate como desalinhamento FORTE: reduza muito o match_score (tipicamente ABAIXO de 70) e registre em red_flags. \"IA aplicada\" (usar LLM/RAG/API) NAO e o mesmo que ML de modelagem - nao confunda.\n\nResponda SOMENTE com JSON valido, sem texto fora do JSON, neste formato:\n{\"match_score\":0,\"english_requirement\":\"nenhum|basico|intermediario|avancado|fluente\",\"work_model\":\"presencial|hibrido|remoto|nao_informado\",\"contract_type\":\"CLT|PJ|a_combinar|nao_informado\",\"salary_clt\":\"R$ X a R$ Y\",\"salary_pj\":\"R$ X a R$ Y\",\"salary_confidence\":\"informado_pela_vaga|mercado|estimado\",\"cover_letter\":\"texto\",\"match_reasons\":[\"...\"],\"red_flags\":[\"...\"]}\n\nVAGA PARA AVALIAR:\nTitulo: {{ $json.title }}\nEmpresa: {{ $json.company }}\nLocalidade: {{ $json.location }}\nFonte: {{ $json.via }}\nTipo detectado: {{ $json.schedule_type }}\nDescricao:\n{{ $json.description }}"
+      }
+    },
+    {
+      "id": "fdfb135e-5c18-49f4-aa1b-02cfac525a8e",
+      "name": "Agendador (5x ao dia BRT)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        7648,
+        1456
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7,9,11,13,15,17,19,21 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b1c97559-49a7-4ba0-8718-3e7d2d374e65",
+      "name": "Ler Reprovadas",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "alwaysOutputData": true,
+      "position": [
+        8112,
+        1680
+      ],
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": 890050946,
+          "cachedResultName": "Reprovadas"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_GOOGLEAPI",
+          "name": "Google Service Account account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Ler Vagas Existentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler Vagas Existentes": {
+      "main": [
+        [
+          {
+            "node": "Ler Reprovadas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Buscas": {
+      "main": [
+        [
+          {
+            "node": "SerpAPI (Google Jobs)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SerpAPI (Google Jobs)": {
+      "main": [
+        [
+          {
+            "node": "Normalizar + job_id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar + job_id": {
+      "main": [
+        [
+          {
+            "node": "Filtrar Novas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filtrar Novas": {
+      "main": [
+        [
+          {
+            "node": "Scoring (Model IA)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse defensivo": {
+      "main": [
+        [
+          {
+            "node": "Aprovada?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aprovada?": {
+      "main": [
+        [
+          {
+            "node": "Registrar na planilha",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notificar Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar Reprovada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Erro no fluxo": {
+      "main": [
+        [
+          {
+            "node": "Alerta de falha (Telegram)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Scoring (Model IA)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scoring (Model IA)": {
+      "main": [
+        [
+          {
+            "node": "Parse defensivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agendador (5x ao dia BRT)": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler Reprovadas": {
+      "main": [
+        [
+          {
+            "node": "Preparar Buscas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "pinData": {}
+}
